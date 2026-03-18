@@ -6,6 +6,40 @@ from pathlib import Path
 from typing import Any, List, Optional
 import json
 
+
+def _resolve_round_resume_refs(
+    *,
+    checkpoint_dir: Optional[str],
+    task_name: str,
+    continue_from_run_id: Optional[str],
+    continue_from_round: Optional[int],
+) -> Optional[dict[str, Any]]:
+    run_id = str(continue_from_run_id or "").strip()
+    if not run_id:
+        return None
+
+    from k_search.utils.round_checkpoints import resolve_round_checkpoint
+
+    ref = resolve_round_checkpoint(
+        checkpoint_dir=checkpoint_dir,
+        task_name=str(task_name or ""),
+        run_id=run_id,
+        round_num=(int(continue_from_round) if continue_from_round is not None else None),
+    )
+    metadata = {}
+    if ref.metadata_path.exists():
+        try:
+            metadata = json.loads(ref.metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+    return {
+        "run_id": ref.run_id,
+        "round_num": ref.round_num,
+        "solution_path": str(ref.solution_path),
+        "world_model_path": (str(ref.world_model_path) if ref.world_model_path is not None else None),
+        "metadata": metadata,
+    }
+
 def _persist_ksearch_solution(
     solution: Any, *, definition_name: str, artifacts_dir: Optional[str]
 ) -> Optional[Path]:
@@ -99,6 +133,12 @@ def generate_and_evaluate(
     wm_stagnation_window: int = 5,
     wm_max_difficulty: Optional[int] = None,
     artifacts_dir: Optional[str] = None,
+    checkpoint_dir: Optional[str] = None,
+    checkpoint_every_round: bool = True,
+    run_id: Optional[str] = None,
+    run_label: Optional[str] = None,
+    continue_from_run_id: Optional[str] = None,
+    continue_from_round: Optional[int] = None,
 ) -> None:
     """
     Generate exactly one solution for the task, then run final evaluation.
@@ -109,6 +149,25 @@ def generate_and_evaluate(
         import wandb  # type: ignore
     except Exception:  # pragma: no cover
         wandb = None
+
+    resume_ref = _resolve_round_resume_refs(
+        checkpoint_dir=checkpoint_dir,
+        task_name=str(getattr(task, "name", "") or ""),
+        continue_from_run_id=continue_from_run_id,
+        continue_from_round=continue_from_round,
+    )
+    if resume_ref is not None:
+        if not continue_from_solution:
+            continue_from_solution = str(resume_ref["solution_path"])
+        if enable_world_model and not continue_from_world_model and resume_ref.get("world_model_path"):
+            continue_from_world_model = str(resume_ref["world_model_path"])
+        print(
+            f"[{getattr(task, 'name', '')}] Resuming from checkpoint run={resume_ref['run_id']} "
+            f"round={resume_ref['round_num']}"
+        )
+        print(f"[{getattr(task, 'name', '')}] Resume solution: {continue_from_solution}")
+        if enable_world_model and continue_from_world_model:
+            print(f"[{getattr(task, 'name', '')}] Resume world model: {continue_from_world_model}")
 
     # Initialize wandb if enabled
     wb_run = None
@@ -138,6 +197,12 @@ def generate_and_evaluate(
                 "save_solutions": bool(save_solutions),
                 "num_eval_workload": num_eval_workload,
                 "artifacts_dir": artifacts_dir,
+                "checkpoint_dir": checkpoint_dir,
+                "checkpoint_every_round": bool(checkpoint_every_round),
+                "run_id": run_id,
+                "run_label": run_label,
+                "continue_from_run_id": continue_from_run_id,
+                "continue_from_round": continue_from_round,
             },
             reinit=True,
         )
@@ -173,6 +238,10 @@ def generate_and_evaluate(
             api_key=api_key,
             base_url=base_url,
             artifacts_dir=artifacts_dir,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_every_round=checkpoint_every_round,
+            run_id=run_id,
+            run_label=(run_label or run_name),
             wm_max_difficulty=wm_max_difficulty,
         )
     else:
@@ -185,6 +254,11 @@ def generate_and_evaluate(
             target_gpu=target_gpu,
             api_key=api_key,
             base_url=base_url,
+            artifacts_dir=artifacts_dir,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_every_round=checkpoint_every_round,
+            run_id=run_id,
+            run_label=(run_label or run_name),
         )
 
     # Generate exactly one solution.
@@ -202,6 +276,10 @@ def generate_and_evaluate(
             max_opt_rounds=max_opt_rounds,
             continue_from_solution=continue_from_solution,
         )
+
+    checkpoint_run_id = str(getattr(generator, "_run_id", "") or "").strip()
+    if checkpoint_run_id:
+        print(f"[{getattr(task, 'name', '')}] Checkpoint run id: {checkpoint_run_id}")
 
     # Append timestamp and uid to ensure uniqueness and traceability
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -289,10 +367,20 @@ def main():
         default=".ksearch",
         help="Base directory for k-search artifacts (solutions, world model snapshots, eval reports).",
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Directory for per-round checkpoints. Default: <repo>/checkpoints",
+    )
+    parser.add_argument("--run-id", default=None, help="Stable id for this generation run's per-round checkpoints")
+    parser.add_argument("--run-label", default=None, help="Optional human-readable label stored with checkpoint metadata")
+    parser.add_argument("--no-round-checkpoints", action="store_true", help="Disable automatic per-round checkpoint persistence")
     parser.add_argument("--baseline-solution", default=None, help="Optional baseline solution name to compare against; if absent, 'vs_base' is omitted")
     parser.add_argument("--num-eval-workload", type=int, default=None, help="If set, evaluate only this many workloads per definition; default uses all workloads")
     # Continue optimization options
     parser.add_argument("--continue-from-solution", default=None, help="Resume optimization from an existing solution name in the dataset")
+    parser.add_argument("--continue-from-run-id", default=None, help="Resume from a saved checkpoint run id under --checkpoint-dir")
+    parser.add_argument("--continue-from-round", type=int, default=None, help="Resume from a specific round in --continue-from-run-id (default: latest)")
     parser.add_argument(
         "--continue-from-world-model",
         default=None,
@@ -393,6 +481,12 @@ def main():
         wm_stagnation_window=args.wm_stagnation_window,
         wm_max_difficulty=args.wm_max_difficulty,
         artifacts_dir=args.artifacts_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_every_round=not args.no_round_checkpoints,
+        run_id=args.run_id,
+        run_label=args.run_label,
+        continue_from_run_id=args.continue_from_run_id,
+        continue_from_round=args.continue_from_round,
         enable_wandb=args.wandb,
         wandb_project=args.wandb_project,
         run_name=args.run_name,
@@ -401,5 +495,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

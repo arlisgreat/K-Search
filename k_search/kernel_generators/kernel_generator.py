@@ -33,6 +33,11 @@ class KernelGenerator:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         reasoning_effort: str = "medium",  # only used for openai reasoning models
+        artifacts_dir: Optional[str] = None,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_every_round: bool = True,
+        run_id: Optional[str] = None,
+        run_label: Optional[str] = None,
     ):
         """
         Args:
@@ -47,6 +52,12 @@ class KernelGenerator:
         self.language = language
         self.target_gpu = target_gpu
         self.reasoning_effort = reasoning_effort
+        self._artifacts_dir = artifacts_dir
+        self._checkpoint_dir = checkpoint_dir
+        self._checkpoint_every_round = bool(checkpoint_every_round)
+        self._run_id = run_id
+        self._run_label = run_label
+        self._round_checkpoint_manager = None
 
         if api_key is None:
             api_key = os.getenv("LLM_API_KEY")
@@ -60,6 +71,86 @@ class KernelGenerator:
             client_kwargs["base_url"] = base_url
 
         self.client = openai.OpenAI(**client_kwargs)
+
+    def _get_round_checkpoint_manager(self, *, task: Any):
+        if not self._checkpoint_every_round:
+            return None
+        task_name = str(getattr(task, "name", "") or "").strip() or "__unknown__"
+        manager = getattr(self, "_round_checkpoint_manager", None)
+        if manager is not None and str(getattr(manager, "task_name", "") or "") == task_name:
+            return manager
+
+        from k_search.utils.round_checkpoints import RoundCheckpointManager
+
+        manager = RoundCheckpointManager(
+            checkpoint_dir=self._checkpoint_dir,
+            task_name=task_name,
+            model_name=str(self.model_name or ""),
+            language=str(self.language or ""),
+            target_gpu=str(self.target_gpu or ""),
+            run_id=self._run_id,
+            run_label=self._run_label,
+        )
+        self._round_checkpoint_manager = manager
+        self._run_id = str(manager.run_id)
+        return manager
+
+    def _save_round_checkpoint(
+        self,
+        *,
+        task: Any,
+        round_num: int,
+        solution: Any,
+        cleaned_code: Any,
+        raw_code: Any,
+        eval_result: Any,
+        best_solution: Any,
+        best_eval: Any,
+        best_score: Optional[float],
+        prompt_text: Optional[str] = None,
+        world_model_json: Optional[str] = None,
+        extra_metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        manager = self._get_round_checkpoint_manager(task=task)
+        if manager is None:
+            return
+
+        def _best_effort_call(name: str, fallback: Any) -> Any:
+            fn = getattr(task, name, None)
+            if not callable(fn):
+                return fallback
+            try:
+                return fn()
+            except Exception:
+                return fallback
+
+        payload = {
+            "passed_count": _best_effort_call("get_last_round_passed_count", None),
+            "total_workloads": _best_effort_call("get_last_round_total_workloads", None),
+            "summary_line": _best_effort_call("get_last_round_summary_line", ""),
+            "best_solution_name": (str(getattr(best_solution, "name", "") or "").strip() or None),
+            "best_score": (float(best_score) if isinstance(best_score, (int, float)) else None),
+        }
+        if isinstance(extra_metadata, dict) and extra_metadata:
+            payload.update(extra_metadata)
+
+        try:
+            manager.save_round(
+                round_num=int(round_num),
+                solution=solution,
+                cleaned_code=cleaned_code,
+                raw_code=raw_code,
+                eval_result=eval_result,
+                best_solution=best_solution,
+                best_eval=best_eval,
+                best_score=best_score,
+                prompt_text=prompt_text,
+                trace_logs=str(_best_effort_call("get_last_round_trace_logs_for_prompt", "") or ""),
+                world_model_json=world_model_json,
+                extra_metadata=payload,
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to save round checkpoint {round_num}: {exc}", flush=True)
 
     def _get_supported_language(self) -> SupportedLanguages:
         language_map = {
@@ -310,6 +401,7 @@ class KernelGenerator:
 
         current_code = None
         current_raw_code = None
+        current_prompt: Optional[str] = None
 
         # Seed initial code: continue from existing solution if provided; else generate fresh.
         seed_solution: Optional[Solution] = None
@@ -340,6 +432,7 @@ class KernelGenerator:
             code_result = self._generate_code_from_prompt(prompt)
             current_code = code_result["cleaned"]
             current_raw_code = code_result["raw"]
+            current_prompt = prompt
 
         best_solution: Optional[Solution] = None
         best_eval = None
@@ -370,6 +463,26 @@ class KernelGenerator:
                 best_eval = eval_result
                 best_score = float(round_score)
                 best_raw_code = str(current_raw_code or "")
+
+            self._save_round_checkpoint(
+                task=task,
+                round_num=int(round_num),
+                solution=solution,
+                cleaned_code=current_code,
+                raw_code=current_raw_code,
+                eval_result=eval_result,
+                best_solution=best_solution,
+                best_eval=best_eval,
+                best_score=best_score,
+                prompt_text=current_prompt,
+                extra_metadata={
+                    "generator_mode": "standard",
+                    "continue_from_solution": (str(continue_from_solution) if continue_from_solution else None),
+                    "current_solution_name": str(getattr(solution, "name", "") or ""),
+                    "round_score": (float(round_score) if isinstance(round_score, (int, float)) else None),
+                    "round_passed": bool(all_passed),
+                },
+            )
 
             # If all workloads passed in this round, log a W&B artifact containing the generated code for traceability.
             if all_passed and wandb is not None and getattr(wandb, "run", None) is not None:
@@ -563,5 +676,6 @@ class KernelGenerator:
                 code_result = self._generate_code_from_prompt(opt_prompt)
                 current_code = code_result["cleaned"]
                 current_raw_code = code_result["raw"]
+                current_prompt = opt_prompt
 
         return best_solution or solution

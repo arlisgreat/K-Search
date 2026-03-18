@@ -2,14 +2,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KSEARCH_ROOT="${KSEARCH_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
-
 # shellcheck disable=SC1091
-source "${KSEARCH_ROOT}/scripts/common_env.sh"
+source "${SCRIPT_DIR}/common_env.sh"
 
 PYTHON_BIN="${PYTHON_BIN:-${VENV_PATH}/bin/python}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
-exec "${PYTHON_BIN}" "${KSEARCH_ROOT}/scripts/repro_gpumode_trimul_results.py" --results-dir "${SCRIPT_DIR}" "$@"
+exec "${PYTHON_BIN}" "${SCRIPT_DIR}/repro_flashinfer_results.py" "$@"

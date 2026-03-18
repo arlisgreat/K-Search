@@ -93,10 +93,22 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
         # Default higher to allow passing full kernel.cu into WM prompts (we avoid truncating code).
         world_model_max_chars: int = 50000,
         artifacts_dir: str | None = None,
+        checkpoint_dir: str | None = None,
+        checkpoint_every_round: bool = True,
+        run_id: str | None = None,
+        run_label: str | None = None,
         wm_max_difficulty: int | None = None,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args,
+            artifacts_dir=artifacts_dir,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_every_round=checkpoint_every_round,
+            run_id=run_id,
+            run_label=run_label,
+            **kwargs,
+        )
         self._world_model_max_chars = int(world_model_max_chars)
         self._artifacts_dir = artifacts_dir
 
@@ -840,6 +852,37 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                     except Exception:
                         pass
 
+                self._save_round_checkpoint(
+                    task=task,
+                    round_num=int(round_num),
+                    solution=solution,
+                    cleaned_code=current_code,
+                    raw_code=current_raw_code,
+                    eval_result=round_eval,
+                    best_solution=best_solution,
+                    best_eval=best_eval,
+                    best_score=best_score,
+                    prompt_text=prompt,
+                    world_model_json=str(self._wm.get(task.name) or ""),
+                    extra_metadata={
+                        "generator_mode": "world_model",
+                        "action_node_id": str(chosen_leaf or ""),
+                        "attempt_idx": int(attempt_idx),
+                        "cycle_start_round": int(cycle_start_round),
+                        "parent_id": str(parent_id or ""),
+                        "parent_is_root": bool(parent_is_root),
+                        "base_score": (float(base_score) if isinstance(base_score, (int, float)) else None),
+                        "cycle_best_round": (int(cycle_best_round) if cycle_best_round else None),
+                        "cycle_best_score": (
+                            float(cycle_best_score) if isinstance(cycle_best_score, (int, float)) and cycle_best_score > 0 else None
+                        ),
+                        "round_score": (float(round_score) if isinstance(round_score, (int, float)) else None),
+                        "round_passed": bool(all_passed),
+                        "no_improve_streak": int(no_improve_streak),
+                        "no_improve_over_base_streak": int(no_improve_over_base_streak),
+                    },
+                )
+
                 rounds_consumed += 1
                 if no_improve_streak >= stagnation_window or no_improve_over_base_streak >= stagnation_window:
                     break
@@ -908,5 +951,3 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
         if last_solution is not None:
             return last_solution
         raise ValueError(f"[{task.name}] No solution was generated (best_solution and last_solution are None).")
-
-
